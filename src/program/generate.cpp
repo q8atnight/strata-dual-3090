@@ -2064,6 +2064,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    strata::core::Verifier::set_commit_async(!multi_gpu);   // #284: see Verifier::set_commit_async (after --split-skip-if-fits)
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
     std::vector<std::unique_ptr<GpuStage>> stages;
@@ -3624,10 +3625,14 @@ int main(int argc, char** argv) {
                  : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
     }();
     auto plan_lend = [&](int64_t& chunk) -> int64_t {
-        static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+        static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+        // #282 (opt-in here): STRATA_PREFILL_AUTO_MAX caps the auto chunk (default 8192 = before #282; 16384 / 32768
+        // stream each expert fewer times per long prompt but need bigger peer / QSA-split buffers)
+        static const int64_t kAutoMax = std::getenv("STRATA_PREFILL_AUTO_MAX") ? std::atoll(std::getenv("STRATA_PREFILL_AUTO_MAX")) : 8192;
         auto slots_for = lend_slots;
         if (o.prefill_auto) {
             for (const int64_t c : kAutoChunks) {
+                if (c > kAutoMax || (c > o.max_context && c > 256)) continue;
                 const int64_t k = slots_for(c);
                 if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
             }
@@ -3746,11 +3751,14 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+            static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+        // #282 (opt-in here): STRATA_PREFILL_AUTO_MAX caps the auto chunk (default 8192 = before #282; 16384 / 32768
+        // stream each expert fewer times per long prompt but need bigger peer / QSA-split buffers)
+        static const int64_t kAutoMax = std::getenv("STRATA_PREFILL_AUTO_MAX") ? std::atoll(std::getenv("STRATA_PREFILL_AUTO_MAX")) : 8192;
             int64_t chunk = 0;
             if (o.prefill_auto) {
                 for (const int64_t c : kAutoChunks)
-                    if (fits(c, true)) { chunk = c; break; }
+                    if (c <= kAutoMax && !(c > o.max_context && c > 256) && fits(c, true)) { chunk = c; break; }
             } else {
                 for (int64_t c = o.prefill_chunk; c >= 256; c /= 2)
                     if (fits(c, false)) { chunk = c; break; }
@@ -4655,6 +4663,9 @@ int main(int argc, char** argv) {
                 begin_before[(size_t) r] = remote_experts[(size_t) r].ms_begin();
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
+            // #284: the last request's final commit may still be running on the verifier's stream (set_commit_async):
+            // everything below reads, restores, parks or zeroes the session from other streams and the host
+            cudaDeviceSynchronize();
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -6067,6 +6078,7 @@ int main(int argc, char** argv) {
     for (int64_t t : produced) std::printf(" %lld", (long long) t);
     std::printf("\n");
     const double decode_ms = decoded > 0 ? total_ms / (double) decoded : 0.0;
+    cudaDeviceSynchronize();   // #284: the last commit (set_commit_async) before anything reads the session
     std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, total_ms,
                 decode_ms > 0.0 ? 1000.0 / decode_ms : 0.0);
     if (n_prompt > 1)
