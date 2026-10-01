@@ -658,7 +658,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.grp_host = m.grp_dev = nullptr;
             m.grp_n = m.grp_tk = 0;
             void *h = nullptr, *d = nullptr;
-            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
+            if (cudaHostAlloc(&h, need * 4, cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
                 cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
                 m.grp_host = (int32_t*) h;
                 m.grp_dev = (int32_t*) d;
