@@ -450,7 +450,11 @@ void Gemm::f16_exact(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
     using Cache = std::map<Key, cublasLtMatmulAlgo_t>;
     if (!lt_) {
         cublasLtHandle_t h = nullptr;
-        if (cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "prefill gemm: cublasLtCreate failed\n"); std::exit(1); }
+        if (cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "prefill gemm: WARNING cublasLtCreate failed - plain GemmEx (not bit-identical)\n");
+            f16(X, W, Y, T, N, K, ldy, 0.0f);
+            return;
+        }
         lt_ = h;
         lt_cache_ = new Cache();
     }
@@ -506,18 +510,38 @@ void Gemm::f16_exact(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
             split_of(rs_[i].algo, sk, r);
             if (rs_[i].state == CUBLAS_STATUS_SUCCESS && sk == want_sk && r == want_rs) pick = i;
         }
-        if (pick < 0) {
-            std::fprintf(stderr, "prefill gemm: no cublasLt algorithm with split-K %d (reduction %d) for N=%lld T=%lld "
-                                 "(reference N=%lld T=%lld)\n", want_sk, want_rs, (long long) N, (long long) T,
-                         (long long) N_ref, (long long) T_ref);
-            std::exit(1);
+        cublasLtMatmulAlgo_t chosen{};
+        bool have = false;
+        if (pick >= 0) { chosen = rs_[pick].algo; have = true; }
+        // no heuristic candidate with that split for this (small) shape: the full shape's own algorithms with the
+        // wanted split, if cublasLt accepts them for this shape (same split -> the same bits)
+        for (int i = 0; i < nf && !have; ++i) {
+            int sk = 0, r = 0;
+            split_of(rf[i].algo, sk, r);
+            if (sk != want_sk || r != want_rs) continue;
+            cublasLtMatmulHeuristicResult_t chk{};
+            if (cublasLtMatmulAlgoCheck(lt, d.op, d.la, d.lb, d.lc, d.lc, &rf[i].algo, &chk) == CUBLAS_STATUS_SUCCESS &&
+                chk.workspaceSize <= wsb) { chosen = rf[i].algo; have = true; }
         }
-        it = cache.emplace(key, rs_[pick].algo).first;
+        if (!have) {   // last resort: the plain product (not bit-identical for this one shape) - never stop the engine
+            static int warned = 0;
+            if (warned++ < 8)
+                std::fprintf(stderr, "prefill gemm: WARNING no cublasLt algorithm with split-K %d (reduction %d) for N=%lld "
+                                     "T=%lld (reference N=%lld T=%lld) - this product uses GemmEx (not bit-identical)\n",
+                             want_sk, want_rs, (long long) N, (long long) T, (long long) N_ref, (long long) T_ref);
+            f16(X, W, Y, T, N, K, ldy, 0.0f);
+            return;
+        }
+        it = cache.emplace(key, chosen).first;
     }
     const float alpha = 1.0f, beta = 0.0f;
     const cublasStatus_t st = cublasLtMatmul(lt, d.op, &alpha, W, d.la, X, d.lb, &beta, Y, d.lc, Y, d.lc, &it->second,
                                              workspace_, wsb, (cudaStream_t) stream_);
-    if (st != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "prefill gemm: cublasLtMatmul failed (%d)\n", (int) st); std::exit(1); }
+    if (st != CUBLAS_STATUS_SUCCESS) {   // never stop the engine over this: the plain product instead
+        std::fprintf(stderr, "prefill gemm: WARNING cublasLtMatmul failed (%d) for N=%lld T=%lld - GemmEx instead\n", (int) st,
+                     (long long) N, (long long) T);
+        f16(X, W, Y, T, N, K, ldy, 0.0f);
+    }
 #endif
 }
 
