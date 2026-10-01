@@ -27,6 +27,11 @@
 
 namespace strata::core {
 
+/// multi-GPU: set once at startup when a peer device is configured (--peer-device N).  The mapped host buffers
+/// the peer card writes into are then allocated with cudaHostAllocPortable; without a peer the flag stays off.
+void set_peer_portable(bool on);
+bool peer_portable();
+
 class PeerExperts {
 public:
     PeerExperts() = default;
