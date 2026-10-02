@@ -1,11 +1,13 @@
 # Strata - the details
 
 The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
-New here? Start with the [README](../README.md) - it has everything you need to install and use it.
+New here? Start with the [README](../README.md); installing step by step is in [INSTALL.md](INSTALL.md), the models in
+[MODELS.md](MODELS.md), common problems in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
 > [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
-> [MCP tools](#tools-from-mcp-servers) · [Images](#images-vision) ·
+> [MCP tools](#tools-from-mcp-servers) · [MCP server](#manage-strata-from-your-ai-assistant-mcp-server) ·
+> [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
 ---
@@ -16,6 +18,15 @@ RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows, engine 0.1
 (`--prefill auto`, 8-bit KV above 4K, KV streaming from 64K). One code-agent prompt per length, 256 generated tokens,
 MTP speculative decoding on. "262K" is the model's full context window (a 259,943-token prompt). The IQ2_XS row was
 measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
+
+**Engine 0.1.36 (#136), the same PC:** Q2_0's prompt experts run on fused int8 tensor-core kernels (RTX 30 and newer):
+4K 1,294 -> 1,570, 32K 2,170 -> 2,653, 128K 2,123 -> 2,468 tokens/s (+16-22%), as close to an FP16 reference as the
+previous kernels (closer at 32K: teacher-forced KL 0.009 vs 0.012). The decode path's block selection and greedy
+argmax run on thread-block clusters (RTX 50, sm_90+; other cards keep the previous kernels; the same tokens): Q2_0 output at 4K 89 -> 93.5, at 128K
+64.5 -> 76.4 tokens/s. `STRATA_PF_FUSED=0` keeps the previous prompt kernels (byte-identical answers to 0.1.35);
+`STRATA_PF_FUSED=1` also runs the native IQ packs' fused kernels (opt-in: IQ2_XS prompts +12% at 4K, +3% at 32K, the
+IQ3 packs about even); `STRATA_QSA_CLUSTER=0` / `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. The tables
+below are 0.1.26's.
 
 ### Prompt processing (tokens/s)
 
@@ -50,14 +61,17 @@ accepted, so a different answer to the same prompt moves it by several percent. 
 [`bench/results/2026-09-28-speed-0114`](../bench/results/2026-09-28-speed-0114/README.md).
 
 IQ3_XXS and IQ3_S at 262K are not measured: with their 43 / 50 GB of experts, a 260K-token context brings a 64 GB PC
-to its memory limit. Use up to 128K with them on 64 GB (setup caps it). IQ3_S (engine 0.1.4 or newer) is only published
-for the original model, not for Swift 1.5.
+to its memory limit by setup's estimate (the experts + the context's KV cache + 24 GB), so setup recommends up to 128K
+with them on 64 GB. A longer context you choose (`--context 262144`, or a pick in its list) is kept, with a note: users
+ran IQ3_S at 256K on 64 GB with RAM to spare (#406). In the low-RAM mode the KV cache stays in VRAM and the context
+does not count against RAM. IQ3_S (engine 0.1.4 or newer) is only published for the original model, not for Swift 1.5.
 
 **KV streaming (engine 0.1.5):** at 64K and more, setup keeps the context's KV cache in RAM and only the part the
 attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Q2_0 at 262K: 50.9 -> 62.6 tokens/s
 (1,589 -> 3,872 experts in VRAM); at 128K about +6%. The attention reads exactly the same values (only where the KV lives changes); it
 costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
-it on.
+it on. Setup turns it on when the RAM has room for it; `--kv-streaming on|off` overrides that (on past the RAM test with a
+note; never with `--kv k8v4` or under WSL, which cannot stream).
 
 **4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
 halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
@@ -76,7 +90,14 @@ slightly differently. How many tokens share an expert depends on the drafts in a
 at temperature 0 can end in a different (equally good) answer when the drafting, the cache state or a resumed
 conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
 every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
--1..-3%, the other models the same; the default stays the fastest rule.
+-1..-3%, the other models the same; the default stays the fastest rule. Through the server, two more things carry
+over from one request to the next (#410): the adaptive tier moves experts between RAM and VRAM (the GPU and the CPU
+round an expert differently), and the prompt cache resumes a repeated prompt and reads only its tail through the
+decode path. For byte-identical repeats add `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0` to the engine's args
+as well (#410): the PCIe share of the missed experts (computed on the GPU instead of the CPU) still made the first
+answer after a start differ from the next ones. Measured here (IQ3_XXS, a 3.6K-token prompt, 4 repeats): with all
+three switches 1 answer of 4, without `--pcie-frac 0` 2 of 4 (the first one differs), with the defaults 2 of 4.
+`--pcie-frac 0` costs decode speed (the missed experts all run on the CPU), so keep it for A/B runs.
 
 **The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
 of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
@@ -86,7 +107,10 @@ English/code subset from before (40,525 ids, ~110 MiB less VRAM, English answers
 almost no drafts). `--draft-vocab cyrillic` takes the English/code subset plus the whole Cyrillic script (58,963
 ids): the shipped subsets hold 142 of the vocabulary's 18,580 Cyrillic tokens, so Ukrainian or Russian answers got
 1.4 tokens a round; with it 2.1, and 83 -> 109 tokens/s (RTX 5090, the NVFP4 fork), English unchanged.
-`tools/draft_vocab.py` builds and inspects subsets.
+`tools/draft_vocab.py` builds and inspects subsets. When the start stops with "the draft head does not fit" (a
+12 GB card with a long context, #474), the engine says how much the head needs, how much VRAM is free and which
+smaller subset fits, and the server's start error repeats it; setup suggests `--draft-vocab en` on cards under
+14 GB (only a suggestion: nothing changes unless you pass it).
 
 **Low-RAM mode (engine 0.1.26, chosen by setup):** normally all of a model's experts are copied into RAM (23-50 GB,
 pinned) and the GPU holds a copy of the most-used ones. On a PC whose RAM cannot hold them beside the system (the
@@ -114,6 +138,12 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   not hold do not fit, it says so and runs the plain mapped mode. The server log shows, per request, how many expert
   reads went to the file (`resident RAM: ... blob reads from the file`: 0 in steady use).
 - `--low-ram resident|mmap` forces one variant (also on a PC with enough RAM, e.g. to try it).
+- Several GPUs (#364, #384): setup recommends one GPU in the low-RAM mode (the resident variant has no layer split
+  yet), and asks; `--gpus 0,1` (or answering 2) shares the model across them with the mapped variant
+  (`--mmap-experts`): the cards together hold more of the experts, and two users measured it 1.3-1.6x faster than
+  one card, but the OS file cache can fill the RAM to 0 free during long prompts. `--yes` keeps one GPU. A config
+  with `--resident-experts` started with `--gpus` switches to `--mmap-experts` with a note, and the engine runs that
+  pair as `--mmap-experts` with a warning instead of refusing it.
 
 **Low-RAM mode without `experts.bin` (engine 0.1.31):** for the native packs (IQ2_XS, IQ3_XXS, IQ3_S, the Coder, Swift,
 Q2_0 packed by `tools/iq_pack.py`; not the canonical Q2_0 pack setup makes for AVX-512 CPUs) the mapped mode no longer
@@ -128,7 +158,9 @@ engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) w
 **A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
 fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
 start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files through the
-OS file cache. It implies `--mmap-experts` and leaves 4 GB of free RAM (a larger N is clamped, with a message). With
+OS file cache. It implies `--mmap-experts` and leaves 4 GB of free RAM (a larger N is clamped to that less 256 MiB,
+with a message; #403: a clamped budget no longer fails the safety check that follows, and a budget that cannot be
+kept at all is a warning, with every expert read from the files). Setup sets N with `--resident-budget-gib N`. With
 the GGUF read in place it also warms the next layer's likely experts: while the CPU works on a layer, a thread applies
 the next layer's router to this layer's input and asks the OS for the pages of the predicted experts that neither the
 GPU nor the RAM budget holds (only pages - the experts computed are the same; `STRATA_LOOKAHEAD=0` turns it off). This
@@ -139,7 +171,8 @@ RTX 5070, against ~3 tokens/s before these changes.
 RAM copy, blobs and MB from the files, the time spent reading them; `routing prefetch`: how many of the file reads had
 been warmed). The server log has the same per request (`expert tiers: GPU ... hits ...; RAM ... blobs, files ...
 blobs ... MB read`), and `GET /metrics` lists `ram_blobs`, `file_blobs` and `file_mb` for each recent request (with
-engine 0.1.31 or newer).
+engine 0.1.31 or newer). It also lists each request's speculative drafts, `drafts_offered` and `drafts_accepted`
+(`null` when the engine did not report them), and their sums since the server started in `totals` (#457).
 
 Time to first token is prompt length / prompt speed: with Q2_0 about 4 s at 4K, 25 s at 32K, under 2 minutes at 128K
 and 4.5 minutes at 262K (engine 0.1.13 made long prompts about twice as fast, below).
@@ -235,12 +268,13 @@ the positions of short greedy answers, 90-91% after a 16K prompt, differing most
 
 ## Before you start
 
-You need **only an NVIDIA driver** (version 580 or newer; update it with the NVIDIA App or from
-[nvidia.com/drivers](https://www.nvidia.com/drivers)). Everything else is installed for you the first time.
+You need **only a graphics driver**: NVIDIA 580 or newer (update it with the NVIDIA App or from
+[nvidia.com/drivers](https://www.nvidia.com/drivers)), or for AMD the one in [INSTALL.md](INSTALL.md#what-you-need).
+Everything else is installed for you the first time.
 
 | | |
 | --- | --- |
-| GPU | NVIDIA **RTX 20, 30, 40 or 50 series**, **12 GB VRAM or more** (8 GB runs, slowly). Measured on an RTX 5070 and an RTX 3090; RTX 20 (Turing, since 0.1.27) was tested by a contributor on an RTX 2070. |
+| GPU | NVIDIA **RTX 20, 30, 40 or 50 series**, **12 GB VRAM or more** (8 GB runs, slowly). Measured on an RTX 5070 and an RTX 3090; RTX 20 (Turing, since 0.1.27) was tested by a contributor on an RTX 2070. Or AMD **Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700, RX 6800 / 6900 series**: [AMD_HIP.md](AMD_HIP.md). |
 | RAM | **64 GB** recommended (see the table above). |
 | CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 (Ryzen 7000/9000) is a bit faster. |
 | Disk | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. An NVMe SSD is strongly recommended. |
@@ -378,6 +412,17 @@ are on; it is started again first, as at a start - so their VRAM and RAM go stra
 the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere. Measured on an RTX 5060 Ti
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
+
+**Keep what the expert cache learned across restarts (opt-in, engine 0.1.36, #477):** a start fills the GPU's expert
+cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use.
+With `"expert_profile_save": "expert-profile-learned.bin"` in `strata-<model>.json` the engine saves that as a
+profile - the experts in VRAM first, then the routing it counted since the start, then the shipped order - on a
+clean exit and every 10 minutes between requests (`"expert_profile_save_every": 5` for another interval, `0` for
+exit only), written to a temporary file and renamed, so a crash never leaves half a file. The next start begins from
+it instead of the config's `--expert-profile` when it is a profile of the same model (else from the config's, as
+before). A relative path is in the Strata folder; one file per model, and a profile per project works the same way
+(point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.
+Without the key nothing is counted or written. Setup rewrites the config when run again: add the key again then.
 
 ---
 
@@ -609,6 +654,29 @@ unmeasured: all the runs above are text.
 
 ---
 
+## Manage Strata from your AI assistant (MCP server)
+
+`tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.
+Once it is added, you can ask your assistant "install Strata for this PC", "start Strata" or "is Strata running?".
+In Claude Code, add it with:
+
+```bash
+claude mcp add strata -- python C:\Users\you\Strata\tools\strata_mcp.py
+```
+
+It has eight tools: status (the running model, what is installed, the hardware, a recommended size), the model
+list, install, start, stop, logs, a speed test, and connection settings for other apps.
+
+Install runs `setup.py` with `--yes` in the background. Before it downloads anything, it shows the plan and waits
+for your OK. Start and stop work like the run scripts and the server's own unload. The MCP server only ends
+processes it started itself. It uses only Python's standard library, so it works before `.venv` exists.
+
+The config snippets for every client, the tool arguments and the safety rules are in
+[docs/MCP_SERVER.md](MCP_SERVER.md). This is the opposite direction from
+[Tools from MCP servers](#tools-from-mcp-servers) above, where the Strata model calls *your* MCP tools.
+
+---
+
 ## Images (vision)
 
 The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
@@ -623,6 +691,11 @@ helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your st
 
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300). The same picture sent again, as chat apps
 do on every turn, is encoded only once.
+
+**A spare GPU for the encoder (0.1.33, #408):** with a card the engine doesn't use, add `"cuda_device": 2` (numbered
+like `nvidia-smi`) to the `"vision"` section of `strata-<model>.json`: the encoder then runs on that card alone. Lower
+`--vram-reserve-mib` in `"args"` to 700 as well, so the engine's cards keep that VRAM for the expert cache. The
+encoder's card needs code in the ready-made encoder (RTX 20/30/40/50).
 
 ### Sending a picture
 

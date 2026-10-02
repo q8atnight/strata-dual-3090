@@ -139,7 +139,7 @@ class Main(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def main(self, argv, ram=63.7, version="0.1.32", n_gpus=1):
+    def main(self, argv, ram=63.7, version="0.1.32", n_gpus=1, model=True, amd=(), free=500.0):
         eng = self.t / "engine"
         eng.mkdir(exist_ok=True)
         (eng / "BUILD.json").write_text(json.dumps({"version": version, "source": "local"}))
@@ -161,11 +161,11 @@ class Main(unittest.TestCase):
             mock.patch.object(setup, "data_folder", lambda d: (self.t / "data", [])),
             mock.patch.object(setup, "installed_configs", lambda: []),
             mock.patch.object(setup, "gpus", lambda: found),
-            mock.patch.object(setup, "amd_gpus", lambda: []),
+            mock.patch.object(setup, "amd_gpus", lambda *a: list(amd)),
             mock.patch.object(setup, "ram_gb", lambda: ram),
             mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, True)),
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
-            mock.patch.object(setup, "free_gb", lambda p: 500.0),
+            mock.patch.object(setup, "free_gb", lambda p: free),
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: self.t / "llama.cpp"),
             mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
@@ -178,7 +178,8 @@ class Main(unittest.TestCase):
             mock.patch.object(setup, "saved_calibration", lambda cfg: None),
             mock.patch.object(setup, "start", mock.Mock(side_effect=AssertionError("started"))),
             mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=FakeGGUF)}),
-            mock.patch.object(sys, "argv", ["setup.py", "--family", "unsloth", "--model", M, "--yes", "--no-start",
+            mock.patch.object(sys, "argv", ["setup.py", "--family", "unsloth", *(["--model", M] if model else []),
+                                            "--yes", "--no-start",
                                             "--models-dir", str(self.t / "models"), *argv]),
             mock.patch("builtins.input", mock.Mock(side_effect=AssertionError("asked"))),
         ]
@@ -238,10 +239,73 @@ class Main(unittest.TestCase):
         self.assertIsNone(cfg)
 
     def test_too_little_ram(self):
-        code, out, cfg = self.main(["--context", "8192"], ram=31.9)
+        code, out, cfg = self.main(["--context", "8192"], ram=31.9, model=False)   # --yes alone: still a stop
         self.assertEqual(code, 1)
         self.assertIn("needs 48 GB of RAM or more", out)
+        self.assertIn("--model UD-Q4_K_XL --yes", out)                             # the way to insist
         self.assertEqual(self.downloads, [])
+
+    def test_amd_is_asked_before_the_download(self):
+        """#429: UD-Q4_K_XL has not run on AMD (CUDA-only prompt kernels): --yes alone stops before the 111 GB
+        download, saying why; it is not refused outright (the owner's rule: --model with --yes goes on)."""
+        r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
+                  "driver": "amdgpu"}]
+        code, out, cfg = self.main(["--context", "8192", "--backend", "hip"], model=False, amd=r9700)
+        self.assertEqual(code, 1, out)
+        self.assertIn("has not been run on AMD cards yet", out)
+        self.assertIn("--model UD-Q4_K_XL --yes", out)
+        self.assertEqual(self.downloads, [])
+
+    def test_resumed_download_needs_room_for_the_rest_only(self):
+        """#425: the disk check counts the finished shards and .part files already there (sizes scaled down: a
+        2 MB "model" with 1.5 MB on the disk, 8 GB of other room needed, 8.001 GB free)."""
+        d = self.t / "models" / "unsloth-UD-Q4_K_XL"
+        d.mkdir(parents=True)
+        (d / (list(setup.UNSLOTH_SHARDS)[0] + ".part")).write_bytes(b"x" * 1_500_000)
+        with mock.patch.dict(setup.MODELS[M], {"download_gb": 0.002}):
+            code, out, cfg = self.main(["--context", "8192"], free=8.001)
+        self.assertNotIn("not enough free disk space", out)
+        self.assertEqual(code, 0, out)
+        for f in d.iterdir():                                                         # the first run "downloaded" them
+            f.unlink()
+        (d / (list(setup.UNSLOTH_SHARDS)[0] + ".part")).write_bytes(b"x" * 1_500_000)
+        with mock.patch.dict(setup.MODELS[M], {"download_gb": 0.003}):              # 1.5 MB still missing: no room
+            code, out, cfg = self.main(["--context", "8192"], free=8.001)
+        self.assertEqual(code, 1)
+        self.assertIn("not enough free disk space", out)
+
+    def test_too_little_ram_with_an_explicit_model_installs(self):
+        """S6 (the owner's rule): --model with --yes is the consent; the risk is said."""
+        code, out, cfg = self.main(["--context", "8192"], ram=31.9)
+        self.assertEqual(code, 0, out)
+        self.assertIn("needs 48 GB of RAM or more; this PC has 32 GB", out)
+        self.assertIn("installing UD-Q4_K_XL with 32 GB of RAM, as you chose", out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "8")
+
+    def test_budget_flag(self):
+        """S4: --resident-budget-gib N is kept; more than the recommendation says what it risks."""
+        code, out, cfg = self.main(["--context", "8192", "--resident-budget-gib", "48"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "48")
+        self.assertIn("more than setup recommends for this PC (40 GiB", out)
+        self.assertIn("Kept as you chose", out)
+        code, out, cfg = self.main(["--context", "8192", "--resident-budget-gib", "32.5"])
+        self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "32.5")
+        self.assertNotIn("more than setup recommends", out)
+
+    def test_budget_flag_with_kv_streaming_is_kept(self):
+        code, out, cfg = self.main(["--context", "131072", "--resident-budget-gib", "40"])
+        self.assertEqual(code, 0, out)
+        args = cfg["args"]
+        self.assertIn("--kv-resident", args)
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "40")      # not 38: the user's number
+        self.assertIn("come on top of your 40 GiB RAM budget", out)
+
+    def test_budget_flag_needs_a_positive_number(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, out, cfg = self.main(["--context", "8192", "--resident-budget-gib", "0"])
+        self.assertEqual(code, 2)                                                   # argparse: N > 0
+        self.assertIsNone(cfg)
 
     def test_one_gpu_and_no_images(self):
         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
