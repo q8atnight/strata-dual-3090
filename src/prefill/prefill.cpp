@@ -2278,6 +2278,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const bool fused_nat = use_mmq && stream_all && !m.pp && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && !m.pp && !lay.native && fused::enabled()) || fused_nat;
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
+                    bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
@@ -2437,7 +2438,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
-                        const bool peer_now = use_mmq && !order_peer.empty();
+                        peer_now = use_mmq && !order_peer.empty();
                         if (peer_now) {
                             PeerPrefill& P = *m.pp;
                             cudaEventRecord(P.ev_in, m.cs);
