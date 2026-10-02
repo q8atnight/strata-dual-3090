@@ -119,6 +119,7 @@ int g_ring_override = 0;   // #340: set by a layer split (Prefill::set_ring_over
 // take any of its layers: IQ2_XS, 4K / 32K, their first version at 384 slots -3% / -6% against MMQ, at 512 +8% / 0%.
 inline bool fused_ring() {
     if (!fused::enabled()) return false;
+    if (core::peer_portable()) return false;   // multi-GPU: --peer-device keeps the MMQ path and its buffer sizes
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native) return true;
     static const bool any = [&lay] {
