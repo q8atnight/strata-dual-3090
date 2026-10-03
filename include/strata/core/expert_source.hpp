@@ -475,6 +475,16 @@ public:
     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
+    /// #286 (Windows): read the experts straight from the drive (FILE_FLAG_NO_BUFFERING, overlapped) instead of
+    /// through the mapped files - the GGUF in place, or a pack's experts.bin - when the file cache could not keep them
+    /// beside `ram_bytes` (the RAM budget), cached now or not (their mapped pages would land in the working set); see
+    /// experts_unbuffered.  The mapped reads' page faults are one small request each, and the pages they bring in
+    /// take the RAM the budget was sized for.  `why` says what decided.
+    bool set_unbuffered(uint64_t ram_bytes, std::string& why);
+    bool unbuffered() const { return !direct_.empty(); }
+    /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
+    /// GPU cache's fill from the profile) - one batch of reads instead of one blob at a time.  At most 64 pairs.
+    void prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n);
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
@@ -489,7 +499,8 @@ public:
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
-    bool warms() const override { return !role_ptr_.empty(); }
+    /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
+    bool warms() const override { return !role_ptr_.empty() && direct_.empty(); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
@@ -506,6 +517,18 @@ private:
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
+    void publish_stage(size_t v, int64_t layer, bool ok, double us);
+    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
+    /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
+    void fill_many(const std::vector<Fill>& todo);
+    /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped)
+    /// into this thread's aligned buffer, then copied into place.  False when a read fails.
+    bool read_direct(const Fill* fills, size_t n) const;
+    std::vector<std::string> paths_;          ///< the mapped files, as maps_
+    std::vector<void*> direct_;               ///< #286: per file, an unbuffered overlapped handle (Windows)
+    std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
+    /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
+    bool staged() const { return !role_ptr_.empty() || !direct_.empty(); }
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
     // ---- CS-T: the GGUF shards in place
     std::string gguf_;
@@ -652,7 +675,8 @@ private:
 /// layout's type and dimensions, and inside the file.  `native` is the --native shard (see set_gguf).
 bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// Fills `dst` (lay.total bytes, the experts.bin layout) from the GGUF files, one role at a time.
+/// `unbuffered`: each chunk read past the file cache (Windows).
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads);
+                            int threads, bool unbuffered = false);
 
 }  // namespace strata::core
