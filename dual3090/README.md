@@ -148,7 +148,7 @@ single-card exactly as upstream.
 ## Provenance
 
 Fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT, copyright its authors),
-based on tag `v0.1.38`: `git log v0.1.38..dual3090 --oneline` lists the 29 commits — our
+based on tag `v0.1.38`: `git log v0.1.38..main --oneline` lists the 29 commits — our
 peer tier and prefill fast paths, plus the upstream PR branches #603, #652 and #583 merged
 in (each A/B'd and gate-tested here first). Parts of this work were merged upstream along
 the way: #186-#188, #202 (`--ple-io ram`), #203, #477 and #531 (`--peer-device`); the
