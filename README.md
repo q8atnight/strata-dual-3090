@@ -1,3 +1,9 @@
+> ## 🖧 This is the **dual-3090 edition** of Strata (SF3.7, based on v0.1.38)
+> Two RTX 3090s + NVLink running **one chat as a single engine** — a peer expert tier on the
+> second card and prompts split over NVLink. Answers are **word-for-word identical to stock**
+> (gate-tested). Everything below is the upstream single-card story; for this build start at
+> **[dual3090/README.md](dual3090/README.md)** — three commands to running.
+
 <h1 align="center">Strata</h1>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
