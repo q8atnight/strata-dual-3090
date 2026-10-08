@@ -48,6 +48,17 @@ Kept changes:
 4. **Router lookahead without AVX2**: `bf16_rows_dot_multi_avx1` (multiply + add), so the file-tier prefetch no
    longer runs AVX2/FMA code on this CPU (it was a SIGILL path; off in the current RAM-arena config).
 5. **GCC 14.2** for C, C++ and the CUDA host (`build-gcc14`), same options as `build`.
+6. **Gate/up MMQ reads the experts in place** (patched copy of llama.cpp's `mmq.cuh` in the build tree): copy kernel
+   75.5 → 31.9 ms per card per turn, engine read −0.7 %. Exact (agent gate PASS). `STRATA_MMQ_INPLACE=0` = old path.
+7. **Grid codebooks in shared memory on Turing** (decode expert kernels; from xrip/llama.cpp-avx1-numa-sm75
+   1536af3b9): `iq_multi_parity` 0 failures; decode +2.0 %.
+8. **`STRATA_HC_FP16=1`** (opt-in, **not bit-exact**): hc read's BF16 GEMMs on FP16 tensor cores. Incremental read
+   −7.7 % per turn, cold 34K −13.6 %. Quality (`prefill_probe.py`, 24 prompts 8K-24K): 20/24 answers identical,
+   24/24 same first token; for scale, an exact rerun 24/24 / 24/24 and `--prefill 4096` 17/24 / 23/24.
+
+**Decode is not always reproducible run to run** on this box: one of three runs of the same binary diverged at turn
+8 of the agent session. A single gate failure needs a rerun; the kernel parity tests are the strict proof. Suspect:
+the adaptive expert swaps (`--adapt-swaps`, on by default) on the second card of the layer split.
 
 Measured and not kept (within ~5 %, and chunk size changes the text): `--prefill 4096/2048`,
 `STRATA_SPLIT_SMALL_OWN=2304/4608`, `--kv-resident 262144`.
@@ -74,11 +85,12 @@ And structure: in layer split a turn's read is one chunk, so CUDA1 waits for CUD
 | # | step | type | exact? | gate |
 |---|---|---|---|---|
 | 1 | ~~Peer mode + QSA/GDN split~~ — measured, loses (section 3) | config | — | done |
-| 2 | Find what `wait_flag_ge_kernel` waits for in decode (CPU miss path vs card hand-off) | measure | — | nsys + pool timing |
+| 2 | ~~`wait_flag_ge_kernel` in decode~~ — `STRATA_VERIFY_PROFILE`: waitA 0.7 ms, waitCPU 0.1 ms per window; the CPU is not on the decode path. Decode is GPU work across many small kernels (expert kernels 31 %) | measure | — | done |
 | 3 | ~~AVX1 Q2_0 rows~~ — done (section 3); the activation quantizer is still scalar (small) | code | yes | done |
 | 4 | ~~Router lookahead AVX1~~ — done (section 3) | code | n/a | done |
 | 5 | `--pcie-frac`: "auto" parses as 0 (`atof`); dual `mkconfig.py` forces 0; `STRATA_PEER_HOT_AT=8700` is a 3090 value | config/code | — | agent session |
-| 6 | hc read BF16 GEMM, MMQ, prompt attention | code | needs a rounding-change OK | — |
+| 6 | ~~hc read~~ — `STRATA_HC_FP16=1` (section 3); MMQ (memory latency at 8 warps/SM, needs pipelining in ggml), prompt attention (300 ms per card) | code | MMQ/attn: yes | — |
+| 7 | Decode nondeterminism: repeat the agent session with `--adapt-swaps 0` | measure | — | 3 identical runs |
 
 Ideas taken from `Strata для AVX1 SM75 и IQ3_XXS.md`: peer prefill + QSA/GDN split A/B, the lookahead SIGILL path,
 `--pcie-frac` parsing, the Q2_0 kernel contract, the weak Q2 check in `native_expert_parity`. Its larger part (one
