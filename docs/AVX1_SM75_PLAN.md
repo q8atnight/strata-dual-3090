@@ -66,6 +66,24 @@ Kept changes:
     Measured and dropped for the down projection: 54 blocks of 6 warps instead of 41 of 8 (+9 %), weights two tiles
     ahead (slower too).
 
+Measured and dropped (bitwise identical, not faster):
+- **Dense decode GEMVs with the columns in shared memory** (`native_mmvq_multi_kernel`; ncu: `lg_throttle` first):
+  blocks that copy the Q8_1 columns once and loop over rows. Head −6 %, IQ4_XS −8..−21 % at 2-4 columns, but Q6_K
+  +8..+25 % and most shapes much slower at 6-8 columns (fewer resident warps); with four row groups per block still
+  mixed (`mmvq_bench`).
+- **MMQ: the IQ3_XXS codebook in shared memory** (patched `mmq-load-tiles.cuh`): gate/up −3 %, down −1 % (87 and
+  400 rows per expert, same checksums) - about 0.2 % of a turn, below the 5 % that a llama.cpp patch has to bring.
+  ncu: `mul_mat_q` holds 255 registers and 53 KB of shared memory, one 8-warp block per SM, issue slots 25-29 % busy,
+  no single stall; pipelining its tile loads needs registers it does not have, and two blocks per SM (I = 64) gave
+  nothing earlier.
+
+**One incremental turn at ~140K (+4.4K tokens), nsys, current binary**: the cards read the prompt one after the
+other (CUDA0 2.77 s, then CUDA1 2.58 s). CUDA0 is kernel-bound (kernels 2.58 s; 11 GB of expert uploads take 1.87 s
+beside them); CUDA1 is PCIe-bound (14 GB of uploads take 2.45 s of its 2.58 s; kernels 2.2 s), so faster kernels
+help CUDA1 little. Kernels per card: `mul_mat_q` 821 / 690 ms, magma BF16 (hc read) 684 / 540, `prompt_attn` 181 /
+181, `block_scores` 145 / 139, FP16 GEMMs 184 / 153, GDN 118 / 94. Overlapping the two cards needs more than one
+chunk per turn, and the chunk size changes the text: not an exact step.
+
 Measured and dropped: `--kv fp16` (more precise than int8, attention 3.5x faster) — but twice the KV bytes to stage
 and read: incremental read **+7.6 %** per turn.
 
