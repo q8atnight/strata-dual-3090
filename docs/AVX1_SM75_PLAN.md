@@ -58,6 +58,13 @@ Kept changes:
 9. **Prompt attention, int8 K/V on Turing**: next chunk prefetched in registers, K and V sharing one shared buffer
    (37.9 → 29.2 KB, two blocks per SM). Bitwise identical (output checksums); kernel −40 % (2,048 queries at 140K:
    21.94 → 13.31 ms); incremental read −3.5 % per turn; agent gate PASS.
+10. **Decode hc read, up projection** (`gr_up_multi_kernel`): `lo` staged as two planes (every read had hit its
+    shared-memory bank twice: 415K of 826K wavefronts were conflicts) and two rows per pass with the (row, token)
+    reductions interleaved (ncu: stalls were `short_scoreboard`). Bitwise identical (`hc_read_bench` checksums for
+    1-8 tokens, `gr_parity`); kernel 30.0 → 23.6 µs at 4 tokens; one hc read call −6 % to −11 % at 3-8 tokens
+    (+2 % at 1); agent session: identical text on all 36 turns, decode median +1.5 %.
+    Measured and dropped for the down projection: 54 blocks of 6 warps instead of 41 of 8 (+9 %), weights two tiles
+    ahead (slower too).
 
 Measured and dropped: `--kv fp16` (more precise than int8, attention 3.5x faster) — but twice the KV bytes to stage
 and read: incremental read **+7.6 %** per turn.
@@ -85,6 +92,21 @@ split gains. Layer split stays.
 | `prompt_attn_kernel` | 325 | QSA attention, prompt |
 
 And structure: in layer split a turn's read is one chunk, so CUDA1 waits for CUDA0 (~4 s each, one after another).
+
+Decode (nsys with graph nodes, 32K context, 512-token answer; ~214 windows of ~46 ms; per card and window):
+dense quantized GEMVs (`native_mmvq_multi_kernel`) 3.1 / 4.2 ms, expert kernels 4.5 / 4.1 ms, hc read 2.6 / 2.5 ms,
+BF16 GEMVs 0.7 ms; the rest is the other card's turn (`wait_flag_ge_kernel`). Peak read bandwidth of a card: 589 GB/s
+(`__ldg` of 16 bytes). The dense GEMVs reach 450-560 GB/s for one column but 180-310 GB/s for four (`mmvq_bench`).
+
+**Timing tests and the CMP idle governor**: `cmp-idle-governor.service` forces P8 on an idle card and restores the
+load profile only after a few seconds of work, so short benches start at 645 MHz. `~/opt-avx1/perf.sh <cmd>` stops
+the governor and the CPU's C-states deeper than C1 for the test and always puts both back (idle cards run hot without
+the governor).
+
+**`pcie_frac` from the startup probe changes the text**: CUDA1's PCIe probe gave 6.0 GB/s in one run (pcie_frac 0.16)
+and 6.1 GB/s in others (0.17); the share of misses sent over PCIe moves experts between GPU and CPU, which round
+differently, and the text changed at turn 33 of 36. Gates now pass `--pcie-frac 0.17`, and the base and the new
+binary run back to back in one job.
 
 ## 5. Next steps (ranked)
 

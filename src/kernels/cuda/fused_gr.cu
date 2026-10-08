@@ -46,6 +46,20 @@ __device__ __forceinline__ float dot8(const uint4 w, const float* x) {
     return acc;
 }
 
+// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
+__device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const float4 x1) {
+    float acc = 0.0f;
+    acc = fmaf(__uint_as_float(w.x << 16), x0.x, acc);
+    acc = fmaf(__uint_as_float(w.x & 0xffff0000u), x0.y, acc);
+    acc = fmaf(__uint_as_float(w.y << 16), x0.z, acc);
+    acc = fmaf(__uint_as_float(w.y & 0xffff0000u), x0.w, acc);
+    acc = fmaf(__uint_as_float(w.z << 16), x1.x, acc);
+    acc = fmaf(__uint_as_float(w.z & 0xffff0000u), x1.y, acc);
+    acc = fmaf(__uint_as_float(w.w << 16), x1.z, acc);
+    acc = fmaf(__uint_as_float(w.w & 0xffff0000u), x1.w, acc);
+    return acc;
+}
+
 __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     __shared__ __align__(16) float xn[D];
     __shared__ float part[WARPS][HC];
@@ -255,46 +269,89 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
+// lo sits in shared memory as two planes per token (floats 0-3 and 4-7 of every chunk of 8: a warp's reads hit no
+// bank twice; as [k][320] every read hit its bank twice), and a warp takes its rows two at a time with all the
+// (row, token) xor reductions interleaved (one after another they waited on each shuffle).  Every sum is the same
+// operations in the same order as before - the same bits; only more of them are in flight.
 __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
-    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+    constexpr int CH = LR / 8;                          // 40 chunks of 8 per row
+    constexpr int RPW = HC * UPM_COLS / WARPS;          // 8 rows per warp
+    __shared__ __align__(16) float4 lo4[kFusedGrMaxT][2][CH];
     __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const int d0 = blockIdx.x * UPM_COLS;
-    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    float* lo = reinterpret_cast<float*>(lo4);
+    for (int i = t; i < T * LR; i += THREADS) {
+        const int k = i / LR, e = i - k * LR;
+        lo[((k * 2 + ((e >> 2) & 1)) * CH + (e >> 3)) * 4 + (e & 3)] = m.a[k].lo[e];
+    }
     __syncthreads();
-    for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
-        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
-        const uint4 wa = __ldg(w4 + lane);
-        const uint4 wb = lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
+    for (int q = 0; q < RPW; q += 2) {
+        int c[2], dd[2], i[2];
+        uint4 wa[2], wb[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = warp + (q + h) * WARPS;
+            c[h] = r / UPM_COLS;
+            dd[h] = r - c[h] * UPM_COLS;
+            i[h] = c[h] * N + d0 + dd[h];
+            const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i[h] * LR);
+            wa[h] = __ldg(w4 + lane);
+            wb[h] = lane < CH - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
+        }
         // the epilogue inputs of this lane's token, fetched while the dots run
-        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
         bool apply = false;
         if (lane < T) {
             const FusedGrArgs& a = m.a[lane];
-            rv = a.R[i];
-            wn = a.w_norm[i];
-            rsc = a.rs[c];
             apply = a.apply;
-            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                rv[h] = a.R[i[h]];
+                wn[h] = a.w_norm[i[h]];
+                rsc[h] = a.rs[c[h]];
+                if (apply) { bo[h] = a.bo_prev[d0 + dd[h]]; ip[h] = a.inj_prev[c[h]]; }
+            }
         }
-        float mine = 0.0f;
+        float acc[2][kFusedGrMaxT];
 #pragma unroll
         for (int k = 0; k < kFusedGrMaxT; ++k) {
-            if (k >= T) break;
-            float acc = dot8(wa, lo[k] + lane * 8);
-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
-            acc = warp_sum(acc);
-            if (lane == k) mine = acc;
-        }
-        if (lane < T) {
-            if (apply) {
-                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
-                m.a[lane].R_out[i] = rv;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                acc[h][k] = 0.0f;
+                if (k < T) {
+                    float s = dot8v(wa[h], lo4[k][0][lane], lo4[k][1][lane]);
+                    if (lane < CH - 32) s += dot8v(wb[h], lo4[k][0][32 + lane], lo4[k][1][32 + lane]);
+                    acc[h][k] = s;
+                }
             }
-            const float x = rv * wn * rsc;
-            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {             // warp_sum of every (row, token), side by side
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k) {
+                if (k < T) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) acc[h][k] += __shfl_xor_sync(0xffffffffu, acc[h][k], o);
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float mine = 0.0f;
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k)
+                if (lane == k) mine = acc[h][k];
+            if (lane < T) {
+                float x = rv[h];
+                if (apply) {
+                    x = fmaf(bo[h], 2.0f * sigmoidf_(ip[h] / (float) HC), x);
+                    m.a[lane].R_out[i[h]] = x;
+                }
+                x = x * wn[h] * rsc[h];
+                g[lane][c[h]][dd[h]] = x * sigmoidf_(mine);
+            }
         }
     }
     __syncthreads();
@@ -591,20 +648,6 @@ __device__ __forceinline__ void cp_async_wait0() {
 #if defined(STRATA_GR_CP_ASYNC)
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 #endif
-}
-
-// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
-__device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const float4 x1) {
-    float acc = 0.0f;
-    acc = fmaf(__uint_as_float(w.x << 16), x0.x, acc);
-    acc = fmaf(__uint_as_float(w.x & 0xffff0000u), x0.y, acc);
-    acc = fmaf(__uint_as_float(w.y << 16), x0.z, acc);
-    acc = fmaf(__uint_as_float(w.y & 0xffff0000u), x0.w, acc);
-    acc = fmaf(__uint_as_float(w.z << 16), x1.x, acc);
-    acc = fmaf(__uint_as_float(w.z & 0xffff0000u), x1.y, acc);
-    acc = fmaf(__uint_as_float(w.w << 16), x1.z, acc);
-    acc = fmaf(__uint_as_float(w.w & 0xffff0000u), x1.w, acc);
-    return acc;
 }
 
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
