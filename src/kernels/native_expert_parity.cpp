@@ -147,7 +147,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             };
             // guarded: the binary runs on AVX-2 CPUs too, and IQ4_XS has no AVX-512 kernel (an empty switch)
             if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) check("avx512", true);
-            if (cpu::iq256_supported(f.gu_type)) check("avx2", false);
+            if (cpu::cpu_avx2_ok() && cpu::iq256_supported(f.gu_type)) check("avx2", false);
         }
         for (int k = 0; k < NT; ++k) {
             cpu::native_quant_h(f, ff[k].data(), hq[k].data());
@@ -180,7 +180,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         // BIT FOR BIT, for 1..8 tokens; then the time of 4 tokens (a verify window) both ways
         for (int role = 0; role < 2; ++role) {
             const int type = role == 0 ? f.gu_type : f.d_type;
-            if (!cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
+            if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
             const int n = role == 0 ? (int) H : (int) FF, rows = role == 0 ? (int) FF : (int) H;
             const size_t rb = role == 0 ? f.gu_row : f.d_row;
             const uint8_t* w = blob.data() + (role == 0 ? 0 : f.down_off);
@@ -238,9 +238,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             }
             cpu::q2_rows_any(blob.data() + f.down_off, f.d_row, (int) (FF / 64), ap, NT, altp, 0, (int) H);
             std::printf("          q2_0 %s down vs ggml down: rel %.2e\n",
-                        cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
+                        cpu::cpu_avx512_ok() ? "AVX-512" : cpu::cpu_avx2_ok() ? "AVX-2" : "scalar", rel(alt, got_c));
         }
-        if (f.d_type == 20) {
+        if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);

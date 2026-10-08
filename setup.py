@@ -3166,7 +3166,10 @@ def main() -> int:
              "Advanced system settings > Performance > Advanced > Virtual memory")
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
-        fail("this CPU has no AVX2; Strata needs at least AVX2")
+        native_iq = a.model in ("IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ1_M")
+        if not (a.build and native_iq):
+            fail("this CPU has no AVX2; use --build with a native IQ model for the safe GGML/scalar CPU path")
+        warn("no AVX2: native IQ rows use GGML CPU dots and Q2_0 rows use the scalar fallback; expect lower speed")
     if a.check:
         say()
         for m, d in MODELS.items():

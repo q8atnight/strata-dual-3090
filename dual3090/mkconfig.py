@@ -28,7 +28,7 @@ from pathlib import Path
 
 # MiB left free on the helper card: the vision encoder (~1.34 GB) warms up
 # there, plus a safety margin (under ~250 MiB free the first prompt OOMs).
-PEER_RESERVE = {"iq3_s": "1850", "iq2_xs": "2700", "q2_0": "2700"}
+PEER_RESERVE = {"iq3_xxs": "1850", "iq3_s": "1850", "iq2_xs": "2700", "q2_0": "2700", "iq1_m": "1850"}
 # The n-gram table is mlocked (--ple-io ram) from this much RAM up; below it
 # the default SSD reads cost a few seconds on cold prompts but nothing else.
 PLE_RAM_MIN_GIB = 96
@@ -73,14 +73,13 @@ def join_args(flags):
 
 
 def model_tag(cfg):
-    m = re.search(r"-(q2_0|iq2_xs|iq3_s)$", cfg.get("model_name", ""))
+    m = re.search(r"-(q2_0|iq2_xs|iq3_xxs|iq3_s|iq1_m)$", cfg.get("model_name", ""))
     if m:
         return m.group(1)
     for t in PEER_RESERVE:  # fall back to a path mention
         if f"/{t}" in json.dumps(cfg.get("args", [])).lower() or f"{t}/" in json.dumps(cfg.get("args", [])).lower():
             return t
-    raise SystemExit("mkconfig: cannot tell the quant (q2_0/iq2_xs/iq3_s) from the config; "
-                     "this build supports these three GSQ-RCO quants only")
+    raise SystemExit("mkconfig: cannot tell the quant (q2_0/iq2_xs/iq3_xxs/iq3_s/iq1_m) from the config")
 
 
 def main():

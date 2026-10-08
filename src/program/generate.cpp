@@ -1760,19 +1760,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI) and its translation unit is
-    // compiled `/arch:AVX512`, so on a CPU without those features it does not fail - it executes an illegal
-    // instruction at some unpredictable token.  Refusing at second zero is the whole point of P2.S3's check.
+    // The AVX-512 kernels are called only after the CPU feature check.
     strata::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
-    // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
-    // chosen above it), and so is ggml-cpu in the release build, which the native pack's layout load initializes
-    // next.  Refused here, by name, rather than an illegal instruction in the first expert.
-    if (!strata::kernels::cpu::cpu_avx2_ok()) {
-        std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which every CPU "
-                             "expert kernel needs; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer\n",
-                     strata::kernels::cpu::cpu_name().c_str());
-        return 2;
-    }
+    // Native packs have GGML and scalar fallbacks; the legacy Q2_0 pack is checked after its format is known.
 
     std::string err;
     if (!o.native_head_gguf.empty() && !o.stream_token) {
@@ -1840,12 +1830,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-    // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
+    // The canonical Q2_0 pack has no portable CPU path. Native packs have runtime fallbacks.
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
-                             "(multi-token for the i-quant gate/up rows)\n",
-                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+    else if (!strata::kernels::cpu::cpu_avx512_ok()) {
+        const bool avx2 = strata::kernels::cpu::cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+        std::fprintf(stderr, "strata generate: native experts use %s gate/up rows and %s Q2_0 rows\n",
+                     avx2 ? "AVX-2" : "GGML CPU vec_dot", strata::kernels::cpu::cpu_avx2_ok() ? "AVX-2" : "scalar");
+    }
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
