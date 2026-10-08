@@ -1120,8 +1120,10 @@ void RouterLookahead::run() {
         }
         const auto t0 = std::chrono::steady_clock::now();
         want.clear();
-        strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                  x_.data(), (int) nt, logits.data());
+        // the AVX2 kernel faults on an AVX-only CPU (Ivy Bridge): its own AVX version there
+        (strata::kernels::cpu::cpu_avx2_ok() ? strata::kernels::cpu::bf16_rows_dot_multi
+                                             : strata::kernels::cpu::bf16_rows_dot_multi_avx1)(
+            routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_, x_.data(), (int) nt, logits.data());
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;

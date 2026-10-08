@@ -21,5 +21,7 @@ void kq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float* out);
 /// The same for `nt` <= 8 tokens (x: nt rows of cols, cols % 8 == 0), out[t * rows + r].
 void bf16_rows_dot_multi(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out);
+/// The same on AVX without AVX2 / FMA (src/kernels/cpu/avx1.cpp; multiply and add, so slightly different rounding).
+void bf16_rows_dot_multi_avx1(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out);
 
 }  // namespace strata::kernels::cpu

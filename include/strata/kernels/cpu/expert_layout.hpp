@@ -47,6 +47,9 @@ bool cpu_avx512_ok();
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel
 /// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).  STRATA_FORCE_AVX2 does not change it.
 bool cpu_avx2_ok();
+/// Whether this CPU (and its OS) runs the AVX kernels of src/kernels/cpu/avx1.cpp (AVX, SSSE3): the Q2_0 rows and the
+/// prefetch router on Sandy / Ivy Bridge.
+bool cpu_avx_ok();
 /// The CPU's brand string (CPUID 0x80000002..4), for messages; "unknown" when it has none.
 std::string cpu_name();
 /// Q2_0 GGUF rows / activation quantizer on the kernels this CPU has.
