@@ -948,6 +948,20 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     }
 }
 
+// The activation rows of a pass (up to GRP_NC entries), staged in shared memory by the whole block: every warp of
+// the block (one weight row each) reads all of them, and from global memory each 4-byte read took a slot of the
+// load/store issue queue - the kernels' first stall on Turing (ncu: lg_throttle) even with L1 hits.  The same bytes, read
+// from shared memory instead: the same bits.  Rows longer than kStageBlocks q8_1 blocks keep the global reads.
+constexpr int kStageBlocks = 80;   // n_embd 2560 / 32 (gate/up); the down rows are n_ff / 32 = 20
+__device__ __forceinline__ void stage_rows(block_q8_1* s_x, const block_q8_1* x, const int* row, int n, int nblk) {
+    const int per = nblk * (int) sizeof(block_q8_1) / 16;   // 16-byte pieces per row (rows of 20 or 80 blocks: whole)
+    for (int c = 0; c < n; ++c) {
+        const uint4* src = reinterpret_cast<const uint4*>(x + (size_t) row[c] * nblk);
+        uint4* dst = reinterpret_cast<uint4*>(s_x + (size_t) c * nblk);
+        for (int i = threadIdx.x; i < per; i += blockDim.x) dst[i] = src[i];
+    }
+}
+
 // native_gu_kernel with the group's entries taken GRP_NC at a time, each weight part decoded once per pass.
 // A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4, and a split window
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
@@ -961,14 +975,16 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               float* __restrict__ gate, float* __restrict__ up) {
     __shared__ __align__(8) uint32_t s_grid[kSGridWords<TG>];
+    __shared__ __align__(16) block_q8_1 s_x[GRP_NC * kStageBlocks];
     const uint32_t* grid = stage_grid<TG>(s_grid, threadIdx.x, blockDim.x);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
-    if (row >= 2 * L.n_ff) return;
+    const bool live = row < 2 * L.n_ff;                      // (not a return: the block shares the staging barriers)
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
     const size_t w_off = (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    const bool staged = xb <= kStageBlocks;
     float* dst = is_up ? up : gate;
     const int ng = *n_groups;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {   // the group stride, as native_gu_kernel
@@ -976,11 +992,19 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; e += GRP_NC) {
             const int n = min(GRP_NC, e1 - e);
-            int off[GRP_NC];
+            int tok[GRP_NC], off[GRP_NC];
 #pragma unroll
-            for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
+            for (int c = 0; c < GRP_NC; ++c) tok[c] = ent_tok[e + min(c, n - 1)];
+            if (staged) {
+                __syncthreads();   // the previous pass is done with s_x
+                stage_rows(s_x, xq, tok, n, xb);
+                __syncthreads();
+            }
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) off[c] = (staged ? min(c, n - 1) : tok[c]) * xb;
+            if (!live) continue;
             float s[GRP_NC];
-            row_dot_multi<TG, GRP_NC>(wr, xq, off, n, nb, lane, s, grid);
+            row_dot_multi<TG, GRP_NC>(wr, staged ? s_x : xq, off, n, nb, lane, s, grid);
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c)
                 if (c < n && lane == c) dst[(size_t) (e + c) * L.n_ff + r] = s[c];
@@ -1028,23 +1052,33 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                                                 const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                                 float* __restrict__ out) {
     __shared__ __align__(8) uint32_t s_grid[kSGridWords<TD>];
+    __shared__ __align__(16) block_q8_1 s_x[GRP_NC * kStageBlocks];
     const uint32_t* grid = stage_grid<TD>(s_grid, threadIdx.x, blockDim.x);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = blockIdx.x * 8 + warp;
-    if (r >= L.n_embd) return;
+    const bool live = r < L.n_embd;                          // (not a return: the block shares the staging barriers)
     const size_t w_off = L.down_off + (size_t) r * L.d_row;
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
+    const bool staged = hb <= kStageBlocks;
     const int ng = *n_groups;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {   // the group stride, as native_gu_kernel
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; e += GRP_NC) {
             const int n = min(GRP_NC, e1 - e);
-            int off[GRP_NC];
+            int ent[GRP_NC], off[GRP_NC];
 #pragma unroll
-            for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
+            for (int c = 0; c < GRP_NC; ++c) ent[c] = e + min(c, n - 1);
+            if (staged) {
+                __syncthreads();   // the previous pass is done with s_x
+                stage_rows(s_x, hq, ent, n, hb);
+                __syncthreads();
+            }
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) off[c] = (staged ? min(c, n - 1) : ent[c]) * hb;
+            if (!live) continue;
             float s[GRP_NC];
-            row_dot_multi<TD, GRP_NC>(wr, hq, off, n, nb, lane, s, grid);
+            row_dot_multi<TD, GRP_NC>(wr, staged ? s_x : hq, off, n, nb, lane, s, grid);
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c)
                 if (c < n && lane == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c];
