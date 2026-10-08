@@ -29,6 +29,9 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
+/// BF16 bits -> FP16 bits, n values (dst may be src).  Exact for a value inside FP16's range (BF16 has the fewer
+/// significant bits); beyond +-65504 it is clamped there, below 2^-24 it becomes FP16's nearest; NaN stays NaN.
+void bf16_to_f16(const uint16_t* src, uint16_t* dst, int64_t n, void* stream);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);

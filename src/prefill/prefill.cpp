@@ -1387,6 +1387,41 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
     return true;
 }
 
+// STRATA_HC_FP16=1 (opt-in, NOT bit-exact): the hyper-connection projections on FP16 tensor cores.  Turing has no BF16
+// tensor cores, so cuBLAS runs the BF16 GEMMs on FP32 cores (magma_sgemmEx, ~25 % of a prompt's GPU time on a
+// CMP 50HX).  A BF16 value is exactly an FP16 one inside FP16's range, so the inputs convert without loss in practice
+// (bf16_to_f16: the activations in place - only these GEMMs read them - the weight into a scratch per call) and the
+// products are exact in FP32; what changes is the order of the FP32 sums inside the tensor cores.
+bool hc_fp16() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_FP16"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+bool f16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
+              std::string& err, const uint16_t* X_lo, cudaStream_t s) {
+    if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
+    const int64_t rows = w->ne1 > 0 ? w->ne1 : 1, cols = w->ne0;
+    static uint16_t* scratch[16] = {};
+    static int64_t cap[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) { err = "prefill: hc fp16: device index"; return false; }
+    if (cap[dev] < rows * cols) {
+        if (scratch[dev] != nullptr) { cudaStreamSynchronize(s); cudaFree(scratch[dev]); }
+        if (cudaMalloc((void**) &scratch[dev], (size_t) (rows * cols) * 2) != cudaSuccess) {
+            cudaGetLastError();
+            scratch[dev] = nullptr;
+            cap[dev] = 0;
+            err = "prefill: hc fp16: no VRAM for the weight scratch";
+            return false;
+        }
+        cap[dev] = rows * cols;
+    }
+    bf16_to_f16((const uint16_t*) w->data, scratch[dev], rows * cols, s);
+    gm.f16(X, scratch[dev], Y, T, rows, cols, 0);
+    if (X_lo) gm.f16(X_lo, scratch[dev], Y, T, rows, cols, 0, 1.0f);
+    return true;
+}
+
 }  // namespace
 
 namespace {
@@ -1891,10 +1926,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo);
                 normed = false;
+                if (hc_fp16()) {   // see hc_fp16: the activations to FP16 in place, then the tensor-core GEMMs
+                    bf16_to_f16(m.xn16, m.xn16, T * D, m.cs);
+                    if (m.xn16_lo) bf16_to_f16(m.xn16_lo, m.xn16_lo, T * D, m.cs);
+                    if (!f16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, m.xn16_lo, m.cs)) return false;
+                    gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                    bf16_to_f16(m.lo16, m.lo16, T * LR, m.cs);
+                    if (m.lo16_lo) bf16_to_f16(m.lo16_lo, m.lo16_lo, T * LR, m.cs);
+                    if (!f16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, m.lo16_lo, m.cs)) return false;
+                    if (!f16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, m.xn16_lo, m.cs)) return false;
+                } else {
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                }
                 if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                               m.mixed_bf_lo);

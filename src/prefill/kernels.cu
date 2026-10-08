@@ -1003,6 +1003,17 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                                                                                       rs, xn16, xn16_lo);
     check("gr_write_norm_rs");
 }
+__global__ void bf16_to_f16_kernel(const uint16_t* src, uint16_t* dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float f = __uint_as_float((uint32_t) src[i] << 16);
+    dst[i] = f != f ? (uint16_t) 0x7e00 : hf(fminf(fmaxf(f, -65504.0f), 65504.0f));
+}
+void bf16_to_f16(const uint16_t* src, uint16_t* dst, int64_t n, void* stream) {
+    if (n <= 0) return;
+    bf16_to_f16_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(src, dst, n);
+    check("bf16_to_f16");
+}
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, lo16_lo, T * LR);
     check("gr_silu");
