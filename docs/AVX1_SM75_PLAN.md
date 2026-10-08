@@ -65,17 +65,21 @@ Kept changes:
     (+2 % at 1); agent session: identical text on all 36 turns, decode median +1.5 %.
     Measured and dropped for the down projection: 54 blocks of 6 warps instead of 41 of 8 (+9 %), weights two tiles
     ahead (slower too).
+11. **MMQ: the IQ3_XXS codebook in shared memory** (configure-time patch of the build tree's `mmq.cuh` /
+    `mmq-load-tiles.cuh` copies, each text required exactly once): the tile loader's 8 scattered 4-byte lookups per
+    thread and tile now hit a 1 KB table that `mul_mat_q<IQ3_XXS>` copies to shared memory first. Same checksums
+    (`prefill_mmq_bench`, 87 and 400 rows per expert); gate/up −3.5..−3.9 %, down (Q2_0) unchanged; agent session back
+    to back with the base: identical text on all 36 turns, incremental read median −0.3 % (CUDA1 is PCIe-bound, see
+    below).
 
 Measured and dropped (bitwise identical, not faster):
 - **Dense decode GEMVs with the columns in shared memory** (`native_mmvq_multi_kernel`; ncu: `lg_throttle` first):
   blocks that copy the Q8_1 columns once and loop over rows. Head −6 %, IQ4_XS −8..−21 % at 2-4 columns, but Q6_K
   +8..+25 % and most shapes much slower at 6-8 columns (fewer resident warps); with four row groups per block still
   mixed (`mmvq_bench`).
-- **MMQ: the IQ3_XXS codebook in shared memory** (patched `mmq-load-tiles.cuh`): gate/up −3 %, down −1 % (87 and
-  400 rows per expert, same checksums) - about 0.2 % of a turn, below the 5 % that a llama.cpp patch has to bring.
-  ncu: `mul_mat_q` holds 255 registers and 53 KB of shared memory, one 8-warp block per SM, issue slots 25-29 % busy,
-  no single stall; pipelining its tile loads needs registers it does not have, and two blocks per SM (I = 64) gave
-  nothing earlier.
+- **MMQ tile-load pipelining**: ncu: `mul_mat_q` holds 255 registers and 53 KB of shared memory, one 8-warp block
+  per SM, issue slots 25-29 % busy, no single stall; pipelining its tile loads needs registers it does not have, and
+  two blocks per SM (I = 64) gave nothing earlier. Not attempted beyond the codebook step (item 11).
 
 **One incremental turn at ~140K (+4.4K tokens), nsys, current binary**: the cards read the prompt one after the
 other (CUDA0 2.77 s, then CUDA1 2.58 s). CUDA0 is kernel-bound (kernels 2.58 s; 11 GB of expert uploads take 1.87 s

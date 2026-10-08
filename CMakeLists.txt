@@ -971,13 +971,41 @@ if(STRATA_NATIVE_EXPERTS)
                             "(a different llama.cpp than the pinned one?)")
       endif()
     endforeach()
+    # The IQ3_XXS codebook in shared memory: the tile loader looked iq3xxs_grid up in global memory (8 scattered 4-byte
+    # reads per thread and tile); mul_mat_q<IQ3_XXS> now copies the 1 KB table to shared memory before its first tile.
+    # The same values, so the same products (prefill_mmq_bench checksums); gate/up -3 % on a CMP 50HX (sm_75).  Each
+    # replaced text must occur exactly once.
+    function(_strata_mmq_once _var _file _from _to)
+      string(LENGTH "${${_var}}" _l0)
+      string(REPLACE "${_from}" "${_to}" _out "${${_var}}")
+      string(LENGTH "${_out}" _l1)
+      string(LENGTH "${_from}" _lf)
+      string(LENGTH "${_to}" _lt)
+      math(EXPR _n "(${_l1} - ${_l0}) / (${_lt} - ${_lf})")
+      if(NOT _n EQUAL 1)
+        message(FATAL_ERROR "strata: ${_file}: the codebook patch text occurs ${_n} times, not once "
+                            "(a different llama.cpp than the pinned one?)")
+      endif()
+      set(${_var} "${_out}" PARENT_SCOPE)
+    endfunction()
+    _strata_mmq_once(_mmq_out mmq.cuh "        ids_dst_shared[j] = j;\n    }\n    __syncthreads();\n"
+      "        ids_dst_shared[j] = j;\n    }\n    if constexpr (type == GGML_TYPE_IQ3_XXS) {\n        for (int i = threadIdx.y*warp_size + threadIdx.x; i < 256; i += nwarps*warp_size) strata_iq3xxs_grid_s[i] = iq3xxs_grid[i];\n    }\n    __syncthreads();\n")
     file(WRITE ${_strata_mmqp}/mmq.cuh "${_mmq_out}\n#define STRATA_MMQ_X_PTRS 1\n")
-    # the headers that include "mmq.cuh" next to themselves, copied unchanged so that include finds the patched copy
+    # the headers that include "mmq.cuh" next to themselves, copied so that include finds the patched copy (the tile
+    # loaders with the codebook change above, the others unchanged)
     file(GLOB _mmq_users RELATIVE ${_strata_mmq} ${_strata_mmq}/*.cuh)
     foreach(_h IN LISTS _mmq_users)
       file(READ ${_strata_mmq}/${_h} _mmq_h)
       string(FIND "${_mmq_h}" "#include \"mmq.cuh\"" _at)
       if(NOT _at EQUAL -1 AND NOT _h STREQUAL "mmq.cuh")
+        if(_h STREQUAL "mmq-load-tiles.cuh")
+          _strata_mmq_once(_mmq_h ${_h}
+            "template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_xxs("
+            "static __shared__ uint32_t strata_iq3xxs_grid_s[256];   // filled by mul_mat_q<IQ3_XXS> before its first tile\ntemplate <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_xxs(")
+          _strata_mmq_once(_mmq_h ${_h}
+            "const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);"
+            "const int2 grid_pos = make_int2(strata_iq3xxs_grid_s[q3[2*l+0]], strata_iq3xxs_grid_s[q3[2*l+1]]);")
+        endif()
         file(WRITE ${_strata_mmqp}/${_h} "${_mmq_h}")
       endif()
     endforeach()
@@ -986,7 +1014,7 @@ if(STRATA_NATIVE_EXPERTS)
       file(WRITE ${_strata_mmqp}/template-instances/mmq-instance-${_t}.cu "${_mmq_inst}")
       target_sources(strata_mmq PRIVATE ${_strata_mmqp}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_mmq}/mmq.cuh)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_mmq}/mmq.cuh ${_strata_mmq}/mmq-load-tiles.cuh)
     target_include_directories(strata_mmq PRIVATE ${_strata_mmqp} ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
