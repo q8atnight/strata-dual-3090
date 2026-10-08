@@ -825,20 +825,30 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(bf16_bits_test PRIVATE include)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
+# src/kernels/cpu/avx1.cpp (CPUs without AVX2): Q2_0 rows bitwise against the scalar reference, the prefetch router's
+# BF16 dot against FP64 (CPU only; exit 77 without AVX)
+if(STRATA_BUILD_TESTS)
+  add_executable(cpu_avx1_parity src/kernels/cpu_avx1_parity.cpp)
+  target_link_libraries(cpu_avx1_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME cpu_avx1_parity COMMAND cpu_avx1_parity)
+  set_tests_properties(cpu_avx1_parity PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/avx1.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 if(MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  set_source_files_properties(src/kernels/cpu/avx1.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
 else()
   # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
   set_source_files_properties(src/kernels/cpu/expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)

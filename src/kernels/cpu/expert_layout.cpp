@@ -52,6 +52,7 @@ void act_quant_q8_1_scalar(const float* x, int n, ActQ& a) {
         a.hx[k] = scale * (float) sum;
     }
 }
+}  // namespace
 
 void q2_0_gguf_rows_multi_scalar(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                  float* const* out, int r0, int r1) {
@@ -80,7 +81,6 @@ void q2_0_gguf_rows_multi_scalar(const uint8_t* w, size_t row_bytes, int nblocks
             out[t][r] = acc - corr;
         }
     }
-}
 }
 
 const ExpertLayout& expert_layout() { return g_layout; }
@@ -113,6 +113,30 @@ bool cpu_avx512_ok() {
         cpuid(7, 0);
         const unsigned ebx = r[1], ecx = r[2];
         return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u);
+    }();
+    return ok;
+}
+
+bool cpu_avx_ok() {
+    static const bool ok = [] {
+        unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuidex(x, 1, 0);
+        for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+        __cpuid_count(1, 0, r[0], r[1], r[2], r[3]);
+#endif
+        // SSSE3 (9), OSXSAVE (27), AVX (28)
+        if (!((r[2] >> 9) & 1u) || !((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return false;
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
+        unsigned lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+        return (xcr0 & 0x6) == 0x6;                         // the OS saves the SSE and AVX state
     }();
     return ok;
 }
@@ -176,6 +200,7 @@ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* co
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else if (cpu_avx2_ok()) q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    else if (cpu_avx_ok()) q2_0_gguf_rows_multi_avx1(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_scalar(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
