@@ -55,6 +55,12 @@ Kept changes:
 8. **`STRATA_HC_FP16=1`** (opt-in, **not bit-exact**): hc read's BF16 GEMMs on FP16 tensor cores. Incremental read
    −7.7 % per turn, cold 34K −13.6 %. Quality (`prefill_probe.py`, 24 prompts 8K-24K): 20/24 answers identical,
    24/24 same first token; for scale, an exact rerun 24/24 / 24/24 and `--prefill 4096` 17/24 / 23/24.
+9. **Prompt attention, int8 K/V on Turing**: next chunk prefetched in registers, K and V sharing one shared buffer
+   (37.9 → 29.2 KB, two blocks per SM). Bitwise identical (output checksums); kernel −40 % (2,048 queries at 140K:
+   21.94 → 13.31 ms); incremental read −3.5 % per turn; agent gate PASS.
+
+Measured and dropped: `--kv fp16` (more precise than int8, attention 3.5x faster) — but twice the KV bytes to stage
+and read: incremental read **+7.6 %** per turn.
 
 **Decode is not always reproducible run to run** on this box: one of three runs of the same binary diverged at turn
 8 of the agent session. A single gate failure needs a rerun; the kernel parity tests are the strict proof. Suspect:
