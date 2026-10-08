@@ -8,6 +8,7 @@ Per turn it records the new prompt tokens, the time to the first answer token, d
   python3 agentbench.py run --url http://127.0.0.1:8080/v1 --label base --engine-log ~/strata-dual-3090/strata-iq3_xxs.log
   python3 agentbench.py run ... --fixed-id --keep-text      (exactness: same prompts every run; start a fresh server)
   python3 agentbench.py check a.json b.json                 (is every turn's text identical?)
+  python3 agentbench.py compare a.json b.json               (b against a, turn by turn: engine read time, decode)
 """
 from __future__ import annotations
 
@@ -149,6 +150,28 @@ def check(a):
     raise SystemExit(0 if ok else 1)
 
 
+def compare(a):
+    x, y = (json.load(open(p)) for p in (a.a, a.b))
+    reads, decs = [], []
+    print(f"{'turn':>4} {'prompt':>7} {'read A ms':>10} {'read B ms':>10} {'B/A':>6} {'dec A':>6} {'dec B':>6} {'B/A':>6}")
+    for t, u in zip(x["turns"], y["turns"]):
+        same = t.get("text") is not None and t.get("text") == u.get("text")
+        e, f = t.get("engine"), u.get("engine")
+        r = f["ms"] / e["ms"] if e and f and e["ms"] else float("nan")
+        d = u["decode_tps"] / t["decode_tps"] if t["decode_tps"] else float("nan")
+        if t["turn"] > 0 and e and f:
+            reads.append(r)
+        if same:
+            decs.append(d)
+        print(f"{t['turn']:4d} {t['prompt_tokens']:7d} {e['ms'] if e else 0:10d} {f['ms'] if f else 0:10d} {r:6.3f} "
+              f"{t['decode_tps']:6.1f} {u['decode_tps']:6.1f} {d:6.3f}{'' if same else '  (text differs)'}")
+    if reads:
+        print(f"median B/A: incremental read time {statistics.median(reads):.3f}", end="")
+    if decs:
+        print(f", decode speed {statistics.median(decs):.3f} (over {len(decs)} turns with identical text)", end="")
+    print()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -169,8 +192,11 @@ def main():
     c = sub.add_parser("check")
     c.add_argument("a")
     c.add_argument("b")
+    m = sub.add_parser("compare")
+    m.add_argument("a")
+    m.add_argument("b")
     a = p.parse_args()
-    run(a) if a.cmd == "run" else check(a)
+    {"run": run, "check": check, "compare": compare}[a.cmd](a)
 
 
 if __name__ == "__main__":
